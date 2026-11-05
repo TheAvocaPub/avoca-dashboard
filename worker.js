@@ -159,15 +159,46 @@ const ADAPTERS = {
       const last = await lastSync(env, 'pos');
       return { connected: !!last, org: last ? 'Lightspeed (uploaded sales reports)' : null, sandbox: false };
     },
+    /* Storage: one KV doc per month (posm:YYYY-MM -> {"DD": count}) so a
+       financial-year view is ~13 reads, not ~365 (speed + KV per-request limits). */
     async fetchRange(env, h, q) {
-      const r = await h.readIngested(q.from, q.to);
-      return r.daysWithData ? { count: r.sums.count || 0 } : null;
+      const docs = await posMonthDocs(env, monthList(q.from.slice(0, 7), q.to.slice(0, 7)));
+      let total = 0, days = 0;
+      docs.forEach(function (d) {
+        if (!d.doc) return;
+        Object.keys(d.doc).forEach(function (dd) {
+          const date = d.month + '-' + dd;
+          if (date >= q.from && date <= q.to) { total += d.doc[dd]; days++; }
+        });
+      });
+      return days ? { count: total } : null;
     },
     async fetchMonthly(env, h, q) {
-      const r = await h.monthlyIngested(q.fromMonth, q.toMonth);
-      return { months: r.months, count: r.byMonth.map(function (m) { return m ? (m.count || 0) : null; }) };
+      const months = monthList(q.fromMonth, q.toMonth);
+      const docs = await posMonthDocs(env, months);
+      return { months, count: docs.map(function (d) {
+        if (!d.doc) return null;
+        return Object.keys(d.doc).reduce(function (t, k) { return t + d.doc[k]; }, 0);
+      }) };
     },
-    async parseExport(env, h, raw) { return parseLightspeedK(raw.text); }
+    async parseExport(env, h, raw) { return parseLightspeedK(raw.text); },
+    async saveExport(env, rows) {
+      const byMonth = {};
+      (rows || []).forEach(function (r) {
+        if (!r || !/^\d{4}-\d{2}-\d{2}$/.test(r.date || '') || typeof r.count !== 'number') return;
+        (byMonth[r.date.slice(0, 7)] = byMonth[r.date.slice(0, 7)] || {})[r.date.slice(8)] = r.count;
+      });
+      let days = 0;
+      await Promise.all(Object.keys(byMonth).map(async function (m) {
+        const key = 'posm:' + m;
+        let cur = {};
+        try { cur = JSON.parse((await env.TOKENS.get(key)) || '{}'); } catch (e) { cur = {}; }
+        Object.assign(cur, byMonth[m]);
+        days += Object.keys(byMonth[m]).length;
+        await env.TOKENS.put(key, JSON.stringify(cur));
+      }));
+      return days;
+    }
   },
 
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
@@ -431,6 +462,13 @@ function csvRows(text) {
   }
   row.push(cur); if (row.some(function (x) { return x !== ''; })) rows.push(row);
   return rows;
+}
+async function posMonthDocs(env, months) {
+  return Promise.all(months.map(async function (m) {
+    let doc = null;
+    try { const raw = await env.TOKENS.get('posm:' + m); doc = raw ? JSON.parse(raw) : null; } catch (e) { doc = null; }
+    return { month: m, doc };
+  }));
 }
 function parseLightspeedK(text) {
   const rows = csvRows(text);
@@ -760,7 +798,9 @@ async function apiIngest(env, request, url) {
     const rows = await adapter.parseExport(env, makeHelpers(env, source), {
       text, contentType: request.headers.get('Content-Type') || ''
     });
-    const saved = await saveIngestedRows(env, source, rows);
+    const saved = typeof adapter.saveExport === 'function'
+      ? await adapter.saveExport(env, rows)
+      : await saveIngestedRows(env, source, rows);
     if (!saved) return json({ error: 'nothing parsed', plain: 'No usable rows were found in that file. Check it\u2019s the right report, or show it to your AI.' }, 422);
     await noteSync(env, source);
     return json({ ok: true, days: saved });
@@ -813,21 +853,22 @@ async function sourceStatus(env, source) {
 async function fetchSlot(env, q) {
   /* One period slot: pull each configured source; null where unavailable. */
   const out = {};
-  for (const source of ['accounting', 'pos', 'rostering']) {
+  await Promise.all(['accounting', 'pos', 'rostering'].map(async function (source) {
     const adapter = ADAPTERS[source];
-    if (!adapter || !adapter.configured) { out[source] = null; continue; }
+    if (!adapter || !adapter.configured) { out[source] = null; return; }
     try {
       const h = makeHelpers(env, source);
       out[source] = await adapter.fetchRange(env, h, q);
-      await noteSync(env, source);
+      /* export-fed sources: "last synced" means last upload, not last read */
+      if (adapter.mode !== 'export') await noteSync(env, source);
     } catch (err) {
       out[source] = null; /* per-source failure never breaks the whole payload */
     }
-  }
+  }));
   return out;
 }
 
-const METRICS_CACHE_TTL = 120; /* seconds: brief cache for live provider data */
+const METRICS_CACHE_TTL = 300; /* seconds: brief cache for live provider data */
 
 async function apiMetrics(env, url) {
   const cur = parseRange(url.searchParams.get('cur'));
@@ -862,24 +903,34 @@ async function apiMetrics(env, url) {
     if (cached) { try { data = JSON.parse(cached); } catch (e) { data = null; } }
   }
   if (!data) {
+    /* Refresh any OAuth token ONCE before fetching in parallel: Xero rotates
+       refresh tokens, so concurrent refreshes would invalidate each other. */
+    for (const source of ['accounting', 'pos', 'rostering']) {
+      const a = ADAPTERS[source];
+      if (a && a.configured && a.auth === 'oauth') { try { await getValidAccessToken(env, source); } catch (e) {} }
+    }
     const periods = {};
-    periods.cur = await fetchSlot(env, { ...base, ...cur });
-    periods.prev = prev ? await fetchSlot(env, { ...base, ...prev }) : null;
-    periods.yoy = yoy ? await fetchSlot(env, { ...base, ...yoy }) : null;
-
-    let trendOut = null;
-    if (trend) {
-      trendOut = { months: monthList(trend.fromMonth, trend.toMonth) };
-      for (const source of ['accounting', 'pos']) {
+    const trendTask = (async function () {
+      if (!trend) return null;
+      const out = { months: monthList(trend.fromMonth, trend.toMonth) };
+      await Promise.all(['accounting', 'pos'].map(async function (source) {
         const adapter = ADAPTERS[source];
-        if (!adapter || !adapter.configured) { trendOut[source] = null; continue; }
+        if (!adapter || !adapter.configured) { out[source] = null; return; }
         try {
           const h = makeHelpers(env, source);
           const series = await adapter.fetchMonthly(env, h, { ...base, ...trend });
-          trendOut[source] = alignSeries(trendOut.months, series);
-        } catch (err) { trendOut[source] = null; }
-      }
-    }
+          out[source] = alignSeries(out.months, series);
+        } catch (err) { out[source] = null; }
+      }));
+      return out;
+    })();
+    const [pc, pp, py, trendOut] = await Promise.all([
+      fetchSlot(env, { ...base, ...cur }),
+      prev ? fetchSlot(env, { ...base, ...prev }) : null,
+      yoy ? fetchSlot(env, { ...base, ...yoy }) : null,
+      trendTask
+    ]);
+    periods.cur = pc; periods.prev = pp; periods.yoy = py;
     data = { generatedAt: new Date().toISOString(), periods: periods, trend: trendOut };
     if (env.TOKENS) {
       try { await env.TOKENS.put(cacheKey, JSON.stringify(data), { expirationTtl: METRICS_CACHE_TTL }); } catch (e) {}
