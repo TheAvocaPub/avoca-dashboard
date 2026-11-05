@@ -721,7 +721,16 @@ async function authCallback(env, source, url) {
     redirect_uri: redirectUri
   }, env));
   if (!res.ok) {
-    return new Response('The connection couldn’t be finished (the tool said no: ' + res.status + '). Your AI will check the app settings - the usual cause is a redirect address that doesn’t match exactly.', { status: 502 });
+    /* Show the provider's own reason code (e.g. invalid_client, invalid_grant):
+       it names the cause and contains no secret. */
+    let reason = '';
+    try {
+      const body = await res.text();
+      let j = null; try { j = JSON.parse(body); } catch (e) {}
+      reason = j ? [j.error, j.error_description].filter(Boolean).join(' - ') : body.slice(0, 200);
+    } catch (e) {}
+    console.log('oauth exchange failed for ' + source + ': ' + res.status + ' ' + reason);
+    return new Response('The connection couldn’t be finished (the tool said no: ' + res.status + (reason ? ', reason: ' + reason : '') + '). Show this message to your AI.', { status: 502, headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
   }
   const t = await res.json();
   await saveTokens(env, source, {
