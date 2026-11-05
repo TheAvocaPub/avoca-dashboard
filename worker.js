@@ -552,6 +552,45 @@ function tandaWindows(from, to) {
   return out;
 }
 
+/* ---------------- Settings sync across devices -------------------------- */
+/* The page keeps settings, "Check your numbers" ticks and organisation
+   confirmations in the browser. Without this, a new phone or laptop would
+   start from blank (and show the unverified banner again). The Worker injects
+   a tiny script that loads the saved copy from KV and saves every change back,
+   so dashboard.html itself is untouched. */
+const UI_KEYS = ['vd_settings', 'vd_recon', 'vd_orgok'];
+const UI_SEED = {
+  vd_settings: JSON.stringify({
+    venueName: 'The Avoca', defaultPeriod: 'thisMonth', weekStart: 1, rolloverHour: 0,
+    timezone: 'Australia/Sydney', accent: 'gold', dataMode: 'live',
+    targets: { wage: 30, cogs: 30, acs: 30 }
+  })
+};
+async function getUiState(env) {
+  try { return JSON.parse((await env.TOKENS.get('uistate')) || '{}'); } catch (e) { return {}; }
+}
+async function dashboardPage(env) {
+  const st = await getUiState(env);
+  for (const k in UI_SEED) if (!(k in st)) st[k] = UI_SEED[k];
+  const payload = JSON.stringify(st).replace(/</g, '\\u003c');
+  const script = '<script>(function(){var st=' + payload + ',keys=' + JSON.stringify(UI_KEYS) + ';' +
+    'function push(k,v){try{fetch("/api/uistate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({k:k,v:v}),keepalive:true});}catch(e){}}' +
+    'try{keys.forEach(function(k){if(k in st){localStorage.setItem(k,st[k]);}else{var l=localStorage.getItem(k);if(l)push(k,l);}});}catch(e){}' +
+    'var o=Storage.prototype.setItem;Storage.prototype.setItem=function(k,v){o.call(this,k,v);try{if(this===window.localStorage&&keys.indexOf(k)>=0)push(k,v);}catch(e){}};' +
+    '})();</script>';
+  const i = dashboardHtml.indexOf('<head>');
+  return i >= 0 ? dashboardHtml.slice(0, i + 6) + script + dashboardHtml.slice(i + 6) : script + dashboardHtml;
+}
+async function apiUiState(env, request) {
+  let body = null;
+  try { body = await request.json(); } catch (e) { return json({ error: 'bad body' }, 400); }
+  if (!body || UI_KEYS.indexOf(body.k) < 0 || typeof body.v !== 'string' || body.v.length > 50000) return json({ error: 'bad key' }, 400);
+  const st = await getUiState(env);
+  st[body.k] = body.v;
+  await env.TOKENS.put('uistate', JSON.stringify(st));
+  return json({ ok: true });
+}
+
 /* ---------------- OAuth begin + callback (generic, per-source) ---------- */
 
 function randomState() {
@@ -1085,8 +1124,12 @@ export default {
     const loggedIn = await isLoggedIn(request, env);
 
     if (path === '/' || path === '/index.html') {
-      if (loggedIn) return htmlResponse(dashboardHtml);
+      if (loggedIn) return htmlResponse(await dashboardPage(env));
       return htmlResponse((await passcodeSet(env)) ? loginPage() : setupPage());
+    }
+    if (path === '/api/uistate' && request.method === 'POST') {
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      return apiUiState(env, request);
     }
     if (path === '/api/metrics' && request.method === 'GET') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
