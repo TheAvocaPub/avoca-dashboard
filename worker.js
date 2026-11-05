@@ -211,13 +211,37 @@ const ADAPTERS = {
      Example (Deputy): pasted permanent token (secret ROSTERING_API_TOKEN).
   */
   rostering: {
-    configured: false,
-    auth: null,
+    /* Tanda (AU). Personal access token (secret ROSTERING_API_TOKEN), created by
+       the owner with scopes: me roster cost. Read-only. Rostered cost =
+       sum of schedule.cost from GET /api/v2/schedules?show_costs=true, pulled in
+       7-day windows (the API's max range). Powers PROJECTED Wage % only. */
+    configured: true,
+    auth: 'token',
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('rostering'); },
+    async status(env, h) {
+      if (!env.ROSTERING_API_TOKEN) return { connected: false };
+      const me = await tandaGet(env, '/users/me');
+      return { connected: true, org: (me && (me.organisation || me.organisation_name)) || null, sandbox: false };
+    },
+    async fetchRange(env, h, q) {
+      if (!env.ROSTERING_API_TOKEN) return null;
+      const windows = tandaWindows(q.from, q.to);
+      if (windows.length > 10) return null; /* projection is for weeks/months; skip year-long ranges */
+      const parts = await Promise.all(windows.map(function (w) {
+        return tandaGet(env, '/schedules?from=' + w[0] + '&to=' + w[1] + '&show_costs=true');
+      }));
+      let cost = 0;
+      parts.forEach(function (list) {
+        (Array.isArray(list) ? list : []).forEach(function (s) {
+          const c = parseFloat(s && s.cost);
+          if (isFinite(c)) cost += c;
+        });
+      });
+      return { cost: Math.round(cost * 100) / 100 };
+    },
     async fetchMonthly(env, h, q) { return { months: [], cost: [] }; }
   }
+
 };
 
 /* ============================================================================
@@ -505,6 +529,27 @@ function parseLightspeedK(text) {
     byDate[d] = (byDate[d] || 0) + n;
   });
   return Object.keys(byDate).sort().map(function (d) { return { date: d, count: byDate[d] }; });
+}
+
+/* ---------------- Tanda helpers (rostering adapter) ---------------------- */
+async function tandaGet(env, path) {
+  const res = await fetch('https://my.tanda.co/api/v2' + path, {
+    headers: { Authorization: 'bearer ' + env.ROSTERING_API_TOKEN, Accept: 'application/json' }
+  });
+  if (!res.ok) { const e = new Error('Tanda HTTP ' + res.status); e.status = res.status; throw e; }
+  return res.json();
+}
+function tandaWindows(from, to) {
+  const out = [];
+  let d = new Date(from + 'T00:00:00Z');
+  const end = new Date(to + 'T00:00:00Z');
+  while (d <= end) {
+    const w = new Date(d.getTime() + 6 * 86400000);
+    const stop = w < end ? w : end;
+    out.push([d.toISOString().slice(0, 10), stop.toISOString().slice(0, 10)]);
+    d = new Date(stop.getTime() + 86400000);
+  }
+  return out;
 }
 
 /* ---------------- OAuth begin + callback (generic, per-source) ---------- */
@@ -911,7 +956,12 @@ async function fetchSlot(env, q, ctx) {
     try {
       const h = makeHelpers(env, source);
       const key = 'slot:' + source + ':' + ctx.versions[source] + ':' + q.from + ':' + q.to + ':' + q.tz + ':' + q.rollover;
-      out[source] = await cached(env, key, SLOT_CACHE_TTL, ctx.force, function () { return adapter.fetchRange(env, h, q); });
+      out[source] = await cached(env, key, SLOT_CACHE_TTL, ctx.force, async function () {
+        const v = await adapter.fetchRange(env, h, q);
+        /* export-fed sources: "last synced" means last upload, not last read */
+        if (adapter.mode !== 'export') await noteSync(env, source);
+        return v;
+      });
     } catch (err) {
       out[source] = null; /* per-source failure never breaks the whole payload */
       ctx.errors[source] = err.status || 500;
