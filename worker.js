@@ -146,12 +146,28 @@ const ADAPTERS = {
      connect.squareupsandbox.com.
   */
   pos: {
-    configured: false,
+    /* Lightspeed Restaurant (K-Series). Live API is partner-gated (access
+       requested 15 Oct 2026), so this runs on the guided-upload rung: the owner
+       exports Back Office > Reports > Sales summary (daily) and uploads
+       sales_summary.csv. One number only: Guest checks per trading day = the
+       "Total transactions" Lightspeed shows. No dollar figure is ever read. */
+    configured: true,
+    mode: 'export',
     auth: null,
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('pos'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('pos'); }
+    async status(env, h) {
+      const last = await lastSync(env, 'pos');
+      return { connected: !!last, org: last ? 'Lightspeed (uploaded sales reports)' : null, sandbox: false };
+    },
+    async fetchRange(env, h, q) {
+      const r = await h.readIngested(q.from, q.to);
+      return r.daysWithData ? { count: r.sums.count || 0 } : null;
+    },
+    async fetchMonthly(env, h, q) {
+      const r = await h.monthlyIngested(q.fromMonth, q.toMonth);
+      return { months: r.months, count: r.byMonth.map(function (m) { return m ? (m.count || 0) : null; }) };
+    },
+    async parseExport(env, h, raw) { return parseLightspeedK(raw.text); }
   },
 
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
@@ -395,6 +411,43 @@ async function apiAccountingBreakdown(env, url) {
     return json({ org: tenant.name, from, to, basis: env.ACCOUNTING_CASH_BASIS === 'true' ? 'cash' : 'accrual',
       wageMatch: xeroWageList(env) ? 'owner-confirmed list' : 'keyword', totals: cols[0] && cols[0].totals, lines: cols[0] && cols[0].lines });
   } catch (e) { return json({ error: plainError(e.status || 500) }, 502); }
+}
+
+/* ---------------- Lightspeed K-Series export parser (pos adapter) -------- */
+function csvRows(text) {
+  const rows = []; let row = [], cur = '', q = false;
+  text = String(text || '').replace(/^﻿/, '');
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"') { if (text[i + 1] === '"') { cur += '"'; i++; } else q = false; }
+      else cur += c;
+    } else if (c === '"') q = true;
+    else if (c === ',') { row.push(cur); cur = ''; }
+    else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      row.push(cur); cur = ''; if (row.some(function (x) { return x !== ''; })) rows.push(row); row = [];
+    } else cur += c;
+  }
+  row.push(cur); if (row.some(function (x) { return x !== ''; })) rows.push(row);
+  return rows;
+}
+function parseLightspeedK(text) {
+  const rows = csvRows(text);
+  if (rows.length < 2) return [];
+  const head = rows[0].map(function (s) { return s.trim().toLowerCase(); });
+  const di = head.findIndex(function (s) { return s === 'interval from' || s === 'date' || s === 'business day'; });
+  const ci = head.findIndex(function (s) { return s === 'guest checks' || s === 'total transactions' || s === 'transactions'; });
+  if (di < 0 || ci < 0) return [];
+  const byDate = {};
+  rows.slice(1).forEach(function (r) {
+    const d = String(r[di] || '').trim().slice(0, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return;
+    const n = parseInt(String(r[ci] || '').replace(/[^0-9-]/g, ''), 10);
+    if (!isFinite(n)) return;
+    byDate[d] = (byDate[d] || 0) + n;
+  });
+  return Object.keys(byDate).sort().map(function (d) { return { date: d, count: byDate[d] }; });
 }
 
 /* ---------------- OAuth begin + callback (generic, per-source) ---------- */
