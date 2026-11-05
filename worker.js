@@ -292,6 +292,11 @@ async function getValidAccessToken(env, source) {
     refresh_token: tokens.refresh_token
   }, env));
   if (!res.ok) {
+    /* Another request may have just rotated the refresh token (Xero refresh
+       tokens are single-use). If the store now holds a newer valid token, use it. */
+    const again = await getTokens(env, source);
+    if (again && again.access_token && again.access_token !== tokens.access_token &&
+        again.expires_at && Date.now() < again.expires_at - skewMs) return again.access_token;
     /* refresh failed: force a reconnect rather than silently serving stale data */
     const e = new Error('refresh failed'); e.status = 401; throw e;
   }
@@ -301,6 +306,7 @@ async function getValidAccessToken(env, source) {
     access_token: fresh.access_token,
     /* CRITICAL: many providers (Xero!) rotate the refresh token - always keep the new one */
     refresh_token: fresh.refresh_token || tokens.refresh_token,
+    obtained_refresh_at: Date.now(),
     expires_at: Date.now() + ((fresh.expires_in || 1800) * 1000)
   };
   await saveTokens(env, source, updated);
@@ -330,7 +336,7 @@ function makeHelpers(env, source) {
       let res = await doFetch();
       if (res.status === 401 && useAuth && ADAPTERS[source].auth === 'oauth') {
         const t = await getTokens(env, source);
-        if (t) { t.expires_at = 0; await saveTokens(env, source, t); } /* force refresh */
+        if (t && t.expires_at && Date.now() > (t.obtained_refresh_at || 0) + 120000) { t.expires_at = 0; await saveTokens(env, source, t); } /* force refresh */
         res = await doFetch();
       }
       if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
@@ -725,7 +731,7 @@ async function authCallback(env, source, url) {
     expires_at: Date.now() + ((t.expires_in || 1800) * 1000),
     obtained_at: new Date().toISOString()
   });
-  await env.TOKENS.put('cachev', String(Date.now()));
+  await bumpDataVersion(env, source);
   /* After token storage, adapters' status() should resolve org name etc. */
   return Response.redirect(url.origin + '/', 302);
 }
@@ -817,7 +823,7 @@ async function apiIngest(env, request, url) {
       : await saveIngestedRows(env, source, rows);
     if (!saved) return json({ error: 'nothing parsed', plain: 'No usable rows were found in that file. Check it\u2019s the right report, or show it to your AI.' }, 422);
     await noteSync(env, source);
-    await env.TOKENS.put('cachev', String(Date.now()));
+    await bumpDataVersion(env, source);
     return json({ ok: true, days: saved });
   } catch (e) {
     return json({ error: 'parse failed', plain: (e && e.plain) || 'That file couldn\u2019t be read. Check it\u2019s the right report, or show it to your AI.' }, 422);
@@ -865,7 +871,29 @@ async function sourceStatus(env, source) {
   }
 }
 
-async function fetchSlot(env, q) {
+/* Per-source caching: each source's pull for a given range is cached on its
+   own, keyed with that source's data version (bumped on upload / connect /
+   disconnect). So uploading a Lightspeed file never re-pulls Xero, and a
+   failed pull is never cached. ?refresh=1 (the Refresh button) bypasses. */
+const SLOT_CACHE_TTL = 1800;   /* 30 min */
+const TREND_CACHE_TTL = 3600;  /* 1 hour */
+
+async function dataVersion(env, source) {
+  return (env.TOKENS && (await env.TOKENS.get('cachev:' + source))) || '0';
+}
+async function bumpDataVersion(env, source) {
+  if (env.TOKENS) await env.TOKENS.put('cachev:' + source, String(Date.now()));
+}
+async function cached(env, key, ttl, force, producer) {
+  if (!force && env.TOKENS) {
+    try { const c = await env.TOKENS.get(key); if (c) return JSON.parse(c); } catch (e) {}
+  }
+  const val = await producer(); /* throws on failure -> nothing cached */
+  if (env.TOKENS) { try { await env.TOKENS.put(key, JSON.stringify(val), { expirationTtl: ttl }); } catch (e) {} }
+  return val;
+}
+
+async function fetchSlot(env, q, ctx) {
   /* One period slot: pull each configured source; null where unavailable. */
   const out = {};
   await Promise.all(['accounting', 'pos', 'rostering'].map(async function (source) {
@@ -873,18 +901,16 @@ async function fetchSlot(env, q) {
     if (!adapter || !adapter.configured) { out[source] = null; return; }
     try {
       const h = makeHelpers(env, source);
-      out[source] = await adapter.fetchRange(env, h, q);
-      /* export-fed sources: "last synced" means last upload, not last read */
-      if (adapter.mode !== 'export') await noteSync(env, source);
+      const key = 'slot:' + source + ':' + ctx.versions[source] + ':' + q.from + ':' + q.to + ':' + q.tz + ':' + q.rollover;
+      out[source] = await cached(env, key, SLOT_CACHE_TTL, ctx.force, function () { return adapter.fetchRange(env, h, q); });
     } catch (err) {
       out[source] = null; /* per-source failure never breaks the whole payload */
+      ctx.errors[source] = err.status || 500;
+      console.log('fetch failed for ' + source + ': ' + (err && err.message));
     }
   }));
   return out;
 }
-
-const METRICS_CACHE_TTL = 1800; /* 30 min; Refresh button bypasses */
-const TREND_CACHE_TTL = 3600; /* seconds: brief cache for live provider data */
 
 async function apiMetrics(env, url) {
   const cur = parseRange(url.searchParams.get('cur'));
@@ -894,82 +920,62 @@ async function apiMetrics(env, url) {
   const trend = parseMonthRange(url.searchParams.get('trend'));
   const tz = url.searchParams.get('tz') || 'Australia/Sydney';
   const rollover = Math.max(0, Math.min(6, parseInt(url.searchParams.get('rollover') || '0', 10) || 0));
-
+  const force = url.searchParams.get('refresh') === '1';
   const base = { tz, rollover };
-  const [sAcc, sPos, sRos] = await Promise.all([
-    sourceStatus(env, 'accounting'),
-    sourceStatus(env, 'pos'),
-    sourceStatus(env, 'rostering')
+
+  const [sAcc, sPos, sRos, vAcc, vPos, vRos] = await Promise.all([
+    sourceStatus(env, 'accounting'), sourceStatus(env, 'pos'), sourceStatus(env, 'rostering'),
+    dataVersion(env, 'accounting'), dataVersion(env, 'pos'), dataVersion(env, 'rostering')
+  ]);
+  const ctx = { force, errors: {}, versions: { accounting: vAcc, pos: vPos, rostering: vRos } };
+
+  /* Refresh any OAuth token ONCE before fetching in parallel: Xero rotates
+     refresh tokens, so concurrent refreshes would invalidate each other. */
+  for (const source of ['accounting', 'pos', 'rostering']) {
+    const a = ADAPTERS[source];
+    if (a && a.configured && a.auth === 'oauth') { try { await getValidAccessToken(env, source); } catch (e) {} }
+  }
+
+  const trendTask = (async function () {
+    if (!trend) return null;
+    const out = { months: monthList(trend.fromMonth, trend.toMonth) };
+    await Promise.all(['accounting', 'pos'].map(async function (source) {
+      const adapter = ADAPTERS[source];
+      if (!adapter || !adapter.configured) { out[source] = null; return; }
+      try {
+        const h = makeHelpers(env, source);
+        const key = 'trend:' + source + ':' + ctx.versions[source] + ':' + trend.fromMonth + ':' + trend.toMonth + ':' + tz + ':' + rollover;
+        out[source] = await cached(env, key, TREND_CACHE_TTL, force, async function () {
+          return alignSeries(out.months, await adapter.fetchMonthly(env, h, { ...base, ...trend }));
+        });
+      } catch (err) {
+        out[source] = null;
+        ctx.errors[source] = ctx.errors[source] || err.status || 500;
+        console.log('trend failed for ' + source + ': ' + (err && err.message));
+      }
+    }));
+    return out;
+  })();
+
+  const [pc, pp, py, trendOut] = await Promise.all([
+    fetchSlot(env, { ...base, ...cur }, ctx),
+    prev ? fetchSlot(env, { ...base, ...prev }, ctx) : null,
+    yoy ? fetchSlot(env, { ...base, ...yoy }, ctx) : null,
+    trendTask
   ]);
 
-  /* The provider calls (periods + trend) are the expensive part and the only
-     thing that brushes provider rate limits on quick reopens/refreshes. Cache
-     them briefly in KV, keyed by the requested ranges; source status stays live.
-     generatedAt is stored with the data so the dashboard's "last synced" reflects
-     the real fetch time even when served from cache. ?refresh=1 forces fresh. */
-  /* cachev is bumped whenever data changes (upload, connect) so caches never go stale on that. */
-  const cachev = (env.TOKENS && (await env.TOKENS.get('cachev'))) || '0';
-  const cacheKey = 'metricscache:' + cachev + ':' + [
-    url.searchParams.get('cur') || '', url.searchParams.get('prev') || '',
-    url.searchParams.get('yoy') || '', url.searchParams.get('trend') || '',
-    tz, rollover
-  ].join('|');
-  const force = url.searchParams.get('refresh') === '1';
-  let data = null;
-  if (!force && env.TOKENS) {
-    const cached = await env.TOKENS.get(cacheKey);
-    if (cached) { try { data = JSON.parse(cached); } catch (e) { data = null; } }
-  }
-  if (!data) {
-    /* Refresh any OAuth token ONCE before fetching in parallel: Xero rotates
-       refresh tokens, so concurrent refreshes would invalidate each other. */
-    for (const source of ['accounting', 'pos', 'rostering']) {
-      const a = ADAPTERS[source];
-      if (a && a.configured && a.auth === 'oauth') { try { await getValidAccessToken(env, source); } catch (e) {} }
-    }
-    const periods = {};
-    const trendKey = 'trendcache:' + cachev + ':' + (url.searchParams.get('trend') || '') + '|' + tz + '|' + rollover;
-    const trendTask = (async function () {
-      if (!trend) return null;
-      /* The 25-month trend is the heaviest pull and past months barely move:
-         cache it for an hour (the Refresh button still forces it fresh). */
-      if (!force && env.TOKENS) {
-        try { const c = await env.TOKENS.get(trendKey); if (c) return JSON.parse(c); } catch (e) {}
-      }
-      const out = { months: monthList(trend.fromMonth, trend.toMonth) };
-      await Promise.all(['accounting', 'pos'].map(async function (source) {
-        const adapter = ADAPTERS[source];
-        if (!adapter || !adapter.configured) { out[source] = null; return; }
-        try {
-          const h = makeHelpers(env, source);
-          const series = await adapter.fetchMonthly(env, h, { ...base, ...trend });
-          out[source] = alignSeries(out.months, series);
-        } catch (err) { out[source] = null; }
-      }));
-      if (env.TOKENS && (out.accounting || out.pos)) {
-        try { await env.TOKENS.put(trendKey, JSON.stringify(out), { expirationTtl: TREND_CACHE_TTL }); } catch (e) {}
-      }
-      return out;
-    })();
-    const [pc, pp, py, trendOut] = await Promise.all([
-      fetchSlot(env, { ...base, ...cur }),
-      prev ? fetchSlot(env, { ...base, ...prev }) : null,
-      yoy ? fetchSlot(env, { ...base, ...yoy }) : null,
-      trendTask
-    ]);
-    periods.cur = pc; periods.prev = pp; periods.yoy = py;
-    data = { generatedAt: new Date().toISOString(), periods: periods, trend: trendOut };
-    if (env.TOKENS) {
-      try { await env.TOKENS.put(cacheKey, JSON.stringify(data), { expirationTtl: METRICS_CACHE_TTL }); } catch (e) {}
-    }
-  }
+  /* Surface a failed pull on the Connections screen instead of silent blanks. */
+  [['accounting', sAcc], ['pos', sPos], ['rostering', sRos]].forEach(function (pair) {
+    const code = ctx.errors[pair[0]];
+    if (code && pair[1] && pair[1].configured && !pair[1].error) pair[1].error = { code: code, plain: plainError(code) };
+  });
 
   return json({
-    generatedAt: data.generatedAt,
+    generatedAt: new Date().toISOString(),
     protected: true,
     sources: { accounting: sAcc, pos: sPos, rostering: sRos },
-    periods: data.periods,
-    trend: data.trend
+    periods: { cur: pc, prev: pp, yoy: py },
+    trend: trendOut
   });
 }
 
@@ -1041,7 +1047,7 @@ export default {
       const source = url.searchParams.get('source');
       if (['accounting', 'pos', 'rostering'].includes(source)) {
         await clearTokens(env, source);
-        await env.TOKENS.put('cachev', String(Date.now()));
+        await bumpDataVersion(env, source);
         return json({ ok: true });
       }
       return json({ error: 'unknown source' }, 400);
