@@ -712,6 +712,7 @@ async function authCallback(env, source, url) {
     expires_at: Date.now() + ((t.expires_in || 1800) * 1000),
     obtained_at: new Date().toISOString()
   });
+  await env.TOKENS.put('cachev', String(Date.now()));
   /* After token storage, adapters' status() should resolve org name etc. */
   return Response.redirect(url.origin + '/', 302);
 }
@@ -803,6 +804,7 @@ async function apiIngest(env, request, url) {
       : await saveIngestedRows(env, source, rows);
     if (!saved) return json({ error: 'nothing parsed', plain: 'No usable rows were found in that file. Check it\u2019s the right report, or show it to your AI.' }, 422);
     await noteSync(env, source);
+    await env.TOKENS.put('cachev', String(Date.now()));
     return json({ ok: true, days: saved });
   } catch (e) {
     return json({ error: 'parse failed', plain: 'That file couldn\u2019t be read. Check it\u2019s the right report, or show it to your AI.' }, 422);
@@ -868,7 +870,8 @@ async function fetchSlot(env, q) {
   return out;
 }
 
-const METRICS_CACHE_TTL = 300; /* seconds: brief cache for live provider data */
+const METRICS_CACHE_TTL = 1800; /* 30 min; Refresh button bypasses */
+const TREND_CACHE_TTL = 3600; /* seconds: brief cache for live provider data */
 
 async function apiMetrics(env, url) {
   const cur = parseRange(url.searchParams.get('cur'));
@@ -891,7 +894,9 @@ async function apiMetrics(env, url) {
      them briefly in KV, keyed by the requested ranges; source status stays live.
      generatedAt is stored with the data so the dashboard's "last synced" reflects
      the real fetch time even when served from cache. ?refresh=1 forces fresh. */
-  const cacheKey = 'metricscache:' + [
+  /* cachev is bumped whenever data changes (upload, connect) so caches never go stale on that. */
+  const cachev = (env.TOKENS && (await env.TOKENS.get('cachev'))) || '0';
+  const cacheKey = 'metricscache:' + cachev + ':' + [
     url.searchParams.get('cur') || '', url.searchParams.get('prev') || '',
     url.searchParams.get('yoy') || '', url.searchParams.get('trend') || '',
     tz, rollover
@@ -910,8 +915,14 @@ async function apiMetrics(env, url) {
       if (a && a.configured && a.auth === 'oauth') { try { await getValidAccessToken(env, source); } catch (e) {} }
     }
     const periods = {};
+    const trendKey = 'trendcache:' + cachev + ':' + (url.searchParams.get('trend') || '') + '|' + tz + '|' + rollover;
     const trendTask = (async function () {
       if (!trend) return null;
+      /* The 25-month trend is the heaviest pull and past months barely move:
+         cache it for an hour (the Refresh button still forces it fresh). */
+      if (!force && env.TOKENS) {
+        try { const c = await env.TOKENS.get(trendKey); if (c) return JSON.parse(c); } catch (e) {}
+      }
       const out = { months: monthList(trend.fromMonth, trend.toMonth) };
       await Promise.all(['accounting', 'pos'].map(async function (source) {
         const adapter = ADAPTERS[source];
@@ -922,6 +933,9 @@ async function apiMetrics(env, url) {
           out[source] = alignSeries(out.months, series);
         } catch (err) { out[source] = null; }
       }));
+      if (env.TOKENS && (out.accounting || out.pos)) {
+        try { await env.TOKENS.put(trendKey, JSON.stringify(out), { expirationTtl: TREND_CACHE_TTL }); } catch (e) {}
+      }
       return out;
     })();
     const [pc, pp, py, trendOut] = await Promise.all([
@@ -1014,6 +1028,7 @@ export default {
       const source = url.searchParams.get('source');
       if (['accounting', 'pos', 'rostering'].includes(source)) {
         await clearTokens(env, source);
+        await env.TOKENS.put('cachev', String(Date.now()));
         return json({ ok: true });
       }
       return json({ error: 'unknown source' }, 400);
