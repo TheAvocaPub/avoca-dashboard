@@ -476,7 +476,20 @@ function parseLightspeedK(text) {
   const head = rows[0].map(function (s) { return s.trim().toLowerCase(); });
   const di = head.findIndex(function (s) { return s === 'interval from' || s === 'date' || s === 'business day'; });
   const ci = head.findIndex(function (s) { return s === 'guest checks' || s === 'total transactions' || s === 'transactions'; });
+  const ti = head.findIndex(function (s) { return s === 'interval to'; });
   if (di < 0 || ci < 0) return [];
+  /* Lightspeed groups long date ranges into weeks/months. A weekly total
+     can't be split into days, so refuse it rather than misdate it. */
+  if (ti >= 0) {
+    rows.slice(1).forEach(function (r) {
+      const a = Date.parse(String(r[di] || '').trim()), b = Date.parse(String(r[ti] || '').trim());
+      if (isFinite(a) && isFinite(b) && b - a > 26 * 3600 * 1000) {
+        const e = new Error('grouped');
+        e.plain = 'This report is grouped by week or month, not by day, so it can\u2019t be used. Export a shorter range (one month at a time) so Lightspeed shows one row per day, then upload that.';
+        throw e;
+      }
+    });
+  }
   const byDate = {};
   rows.slice(1).forEach(function (r) {
     const d = String(r[di] || '').trim().slice(0, 10);
@@ -807,7 +820,7 @@ async function apiIngest(env, request, url) {
     await env.TOKENS.put('cachev', String(Date.now()));
     return json({ ok: true, days: saved });
   } catch (e) {
-    return json({ error: 'parse failed', plain: 'That file couldn\u2019t be read. Check it\u2019s the right report, or show it to your AI.' }, 422);
+    return json({ error: 'parse failed', plain: (e && e.plain) || 'That file couldn\u2019t be read. Check it\u2019s the right report, or show it to your AI.' }, 422);
   }
 }
 
